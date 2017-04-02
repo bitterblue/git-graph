@@ -61,6 +61,11 @@
     WHERE parent_count > 1
     SET c :Merge;" {}])
 
+(def label-test-files-stmt
+  ["MATCH (f:File)
+    WHERE f.name CONTAINS '/test/'
+    SET f :Test;"])
+
 ;; TODO: merge authors with identical names
 (def merge-authors-with-same-name-stmt
   ["MATCH (a:Author), (b:Author)
@@ -78,7 +83,8 @@
                 session (neobolt/create-session conn)]
       (let [stmts (concat (map import-commit-stmt cs)
                           (mapcat import-parent-rel-stmts cs)
-                          [label-merge-commits-stmt])]
+                          [label-merge-commits-stmt
+                           label-test-files-stmt])]
         (dorun (map (partial run-query! session) stmts))))))
 
 (defn count-commits
@@ -90,14 +96,16 @@
 
 (defn pair-freqs
   "Returns a seq of file pairs and how often they occur. Only pairs occuring more
-  than n times are counted."
-  [session n]
+  than n times are returned, and only a number up to the specified limit."
+  [session n limit]
   (let [query  "MATCH (a:File)<-[:CHANGES]-(c:Commit)-[:CHANGES]->(b:File)
-                WHERE NOT c:Merge AND id(a) < id(b)
+                WHERE NOT c:Merge AND NOT a:Test AND NOT b:Test AND id(a) < id(b)
                 WITH a, b, count(c) AS freq
                 WHERE freq > {maxfreq}
-                RETURN a.name AS a, b.name AS b, freq;"
-        result (run-query! session [query {:maxfreq n}])]
+                RETURN a.name AS a, b.name AS b, freq
+                ORDER BY freq DESC
+                LIMIT {limit};"
+        result (run-query! session [query {:maxfreq n :limit limit}])]
     (clojure.walk/keywordize-keys result)))
 
 (defn count-changes
@@ -116,3 +124,31 @@
   [n00 n01 n10 n11]
   (/ (- (* n11 n00) (* n10 n01))
      (Math/sqrt (* (+ n10 n11) (+ n00 n01) (+ n00 n10) (+ n01 n11)))))
+
+(defn coevolution-analysis [session pairs]
+  (let [num-commits   (count-commits session)
+        count-changes (memoize (partial count-changes session))
+        calculate-mcc (fn [{:keys [a b freq]}]
+                        (let [only-a  (- (count-changes a) freq)
+                              only-b  (- (count-changes b) freq)
+                              neither (- num-commits only-a only-b freq)]
+                          {:only-a  only-a
+                           :only-b  only-b
+                           :neither neither
+                           :both    freq
+                           :mcc     (mcc neither only-a only-b freq)}))]
+    (into [] (map (fn [p] (merge p (calculate-mcc p)))) pairs)))
+
+;; TODO: implement chi² test and check p-values
+
+(defmacro with-bolt-sess [bolt-uri & body]
+  `(with-open [conn#  (neobolt/connect ~bolt-uri)
+               ~'sess (neobolt/create-session conn#)]
+     ~@body))
+
+;; more possible metrics
+;; * bus factor (number of authors per file)
+;; * most frequently changed files (hotspot analysis)
+;; * testing quotient (how strictly are changes to main accompanied by changes to test?)
+;;   could indicate either lack of testing or lack of refactoring caused by rigidity
+;;   of the test suite
