@@ -1,7 +1,8 @@
 version: '3'
 services:
   neo4j:
-    image: neo4j:3.1.3
+    build: ./neo4j-apoc
+    image: neo4j-apoc
     volumes:
       - graph-data:/data
     ports:

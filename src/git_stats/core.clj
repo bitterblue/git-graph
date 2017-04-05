@@ -66,11 +66,11 @@
     WHERE f.name CONTAINS '/test/'
     SET f :Test;"])
 
-;; TODO: merge authors with identical names
 (def merge-authors-with-same-name-stmt
   ["MATCH (a:Author), (b:Author)
-    WHERE a <> b AND a.name = b.name
-    " {}])
+    WHERE a.name = b.name AND id(a) < id(b)
+    CALL apoc.refactor.mergeNodes([a,b]) YIELD node
+    RETURN node;"])
 
 (defn run-query! [session stmt]
   (let [[qry params] stmt]
