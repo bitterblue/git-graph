@@ -59,7 +59,7 @@
   ["MATCH (c:Commit)-[p:HAS_PARENT]->()
     WITH c, count(p) as parent_count
     WHERE parent_count > 1
-    SET c :Merge;" {}])
+    SET c :Merge;"])
 
 (def label-test-files-stmt
   ["MATCH (f:File)
@@ -67,31 +67,53 @@
     SET f :Test;"])
 
 (def merge-authors-with-same-name-stmt
+  ;; FIXME: This fails if an author appears more than twice, because during the
+  ;; first merge two nodes will be replaced by a new one, so during the second
+  ;; merge, one of the originally matched nodes will no longer exist. This
+  ;; results in a NotFoundException for that node.
   ["MATCH (a:Author), (b:Author)
     WHERE a.name = b.name AND id(a) < id(b)
     CALL apoc.refactor.mergeNodes([a,b]) YIELD node
     RETURN node;"])
 
-(defn run-query! [session stmt]
-  (let [[qry params] stmt]
-    (neobolt/query session qry (clojure.walk/stringify-keys params))))
+(defn run-query!
+  ([session qry] (run-query! session qry nil))
+  ([session qry params]
+   (neobolt/query session qry (clojure.walk/stringify-keys params))))
+
+(defn run-statements! [conn stmts]
+  (with-open [session (neobolt/create-session conn)]
+    (doseq [[qry params] stmts]
+      (run-query! session qry params))))
+
+
+;; TODO: rewrite import to run in parallel, first for the list of commits,
+;;       then files, then authors, creating historical relations last
+;;       --> extract, transform, load
+
 
 (defn import-graph [repo-path]
   (let [repo (load-repo repo-path)
         cs   (commits repo)]
-    (with-open [conn    (neobolt/connect "bolt://localhost")
-                session (neobolt/create-session conn)]
-      (let [stmts (concat (map import-commit-stmt cs)
-                          (mapcat import-parent-rel-stmts cs)
-                          [label-merge-commits-stmt
-                           label-test-files-stmt])]
-        (dorun (map (partial run-query! session) stmts))))))
+    (with-open [conn (neobolt/connect "bolt://localhost")]
+      (let [grain-size    250
+            run-parallel! (fn [stmts]
+                            (dorun (pmap (partial run-statements! conn)
+                                         (partition-all grain-size stmts))))]
+        (println "Extracting commits ...")
+        (run-parallel! (map import-commit-stmt cs))
+        (println "Extracting history relations ...")
+        (run-parallel! (mapcat import-parent-rel-stmts cs))
+        (println "Post-processing the graph ...")
+        (run-statements! conn [label-merge-commits-stmt
+                               label-test-files-stmt
+                               merge-authors-with-same-name-stmt])))))
 
 (defn count-commits
   "Counts the total number of commits, excluding merge commits."
   [session]
   (let [query  "MATCH (c:Commit) WHERE NOT c:Merge RETURN count(c) AS n;"
-        result (neobolt/query session query)]
+        result (run-query! session query)]
     (get (first result) "n")))
 
 (defn pair-freqs
@@ -99,13 +121,15 @@
   than n times are returned, and only a number up to the specified limit."
   [session n limit]
   (let [query  "MATCH (a:File)<-[:CHANGES]-(c:Commit)-[:CHANGES]->(b:File)
-                WHERE NOT c:Merge AND NOT a:Test AND NOT b:Test AND id(a) < id(b)
+                WHERE NOT c:Merge
+                      AND NOT a:Test AND NOT b:Test
+                      AND a.name ENDS WITH '.java' AND b.name ENDS WITH '.java' AND id(a) < id(b)
                 WITH a, b, count(c) AS freq
                 WHERE freq > {maxfreq}
                 RETURN a.name AS a, b.name AS b, freq
                 ORDER BY freq DESC
                 LIMIT {limit};"
-        result (run-query! session [query {:maxfreq n :limit limit}])]
+        result (run-query! session query {:maxfreq n :limit limit})]
     (clojure.walk/keywordize-keys result)))
 
 (defn count-changes
@@ -114,12 +138,13 @@
   (let [query  "MATCH (c:Commit)-[:CHANGES]->(f:File)
                 WHERE f.name =  {filename} AND NOT c:Merge
                 RETURN count(c) AS n;"
-        result (run-query! session [query {:filename f}])]
+        result (run-query! session query {:filename f})]
     (get (first result) "n")))
 
 (defn mcc
-  "Calculate the Matthews Correlation Coefficient (MCC). The MCC ranges between -1 and 1,
-  where 1 indicates a perfect agreement, 0 indicates no correlation and -1 complete
+  "Calculate the Matthews Correlation Coefficient (MCC). The MCC indicates the
+  strength of an association and ranges between -1 and 1, where 1 indicates a
+  perfect agreement, 0 indicates no correlation and -1 complete
   disagreement."
   [n00 n01 n10 n11]
   (/ (- (* n11 n00) (* n10 n01))
@@ -141,14 +166,18 @@
 
 ;; TODO: implement chi² test and check p-values
 
-(defmacro with-bolt-sess [bolt-uri & body]
-  `(with-open [conn#  (neobolt/connect ~bolt-uri)
+
+(defmacro with-local-bolt-sess [& body]
+  `(with-open [conn#  (neobolt/connect "bolt://localhost")
                ~'sess (neobolt/create-session conn#)]
      ~@body))
 
 ;; more possible metrics
-;; * bus factor (number of authors per file)
 ;; * most frequently changed files (hotspot analysis)
+;;   MATCH (f:File)<--(c:Commit) WITH f, count(c) AS change_counter RETURN f.name, change_counter ORDER BY change_counter DESC;
+;; * bus factor (number of authors per file)
+;;   requires clean-up of author nodes
+;;   MATCH (f:File)<--(c:Commit)<--(a:Author) WITH f, count(a) AS busfactor WHERE busfactor < 1 RETURN f.name, busfactor LIMIT 10;
 ;; * testing quotient (how strictly are changes to main accompanied by changes to test?)
-;;   could indicate either lack of testing or lack of refactoring caused by rigidity
-;;   of the test suite
+;;   could indicate either lacking test coverage or a rigidity hazard caused by
+;;   the test suite that will make refactoring expensive
