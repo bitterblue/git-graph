@@ -1,6 +1,6 @@
-(ns git-stats.core-test
+(ns git-graph.core-test
   (:require [clojure.test :refer :all]
-            [git-stats.core :refer :all]))
+            [git-graph.core :refer :all]))
 
 (deftest a-test
   (testing "FIXME, I fail."

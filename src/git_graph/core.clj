@@ -1,4 +1,4 @@
-(ns git-stats.core
+(ns git-graph.core
   (:require [clj-jgit
              [porcelain :as jgit]
              [querying :as jgit-query]]
