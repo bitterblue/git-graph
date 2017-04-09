@@ -2,6 +2,7 @@
   (:require [clj-jgit
              [porcelain :as jgit]
              [querying :as jgit-query]]
+            [clojure.core.async :as async :refer [<!!]]
             [clojurewerkz.neocons.bolt :as neobolt]))
 
 (defn- load-repo [path]
@@ -13,47 +14,73 @@
   [repo]
   (map (partial jgit-query/commit-info repo) (jgit/git-log repo)))
 
-(defn import-commit-stmt [c]
-  (let [props     {:id      (:id c)
-                   :time    (.getTime (:time c))
-                   :message (:message c)}
-        files     (for [[f a] (:changed_files c)]
-                    {:name f :action (name a)})
-        author    {:name  (:author c)
-                   :email (:email c)}
-        committer {:name  (-> c :raw .getCommitterIdent .getName)
-                   :email (-> c :raw .getCommitterIdent .getEmailAddress)}]
-    ["MERGE (c:Commit {id: {props}.id})
-      SET c = {props}
-      WITH c
-      MERGE (a {name: {author}.name, email: {author}.email})
-      SET a :Author
-      WITH c, a
-      CREATE UNIQUE (a)-[:AUTHORED]->(c)
-      WITH c
-      MERGE (a {name: {committer}.name, email: {committer}.email})
-      SET a :Committer
-      WITH c, a
-      CREATE UNIQUE (a)-[:COMMITTED]->(c)
-      WITH c
-      UNWIND {files} AS file
-      MERGE (f:File {name: file.name})
-      WITH c, f, file.action as a
-      CREATE UNIQUE (c)-[:CHANGES {action: a}]->(f);"
-     {:props     props
-      :files     files
-      :author    author
-      :committer committer}]))
+(defn load-commits-stmt [cs]
+  (let [commit-properties (fn [c] {:id      (:id c)
+                                   :time    (.getTime (:time c))
+                                   :message (:message c)})]
+    ["UNWIND {commits} AS commit
+      MERGE (c:Commit {id: commit.id}) SET c = commit;"
+     {:commits (mapv commit-properties cs)}]))
 
-(defn import-parent-rel-stmts [c]
-  (let [id      (:id c)
-        parents (-> c :raw .getParents)]
-    (map (fn [p] ["MATCH (a:Commit), (b:Commit)
-                   WHERE a.id = {id} AND b.id = {pid}
-                   CREATE UNIQUE (a)-[r:HAS_PARENT]->(b);"
-                  {:id  id
-                   :pid (-> p .getName str)}])
-         parents)))
+(defn load-authorships-stmt [cs]
+  (let [author      (fn [c] {:name (:author c) :email (:email c)})
+        authorships (->> cs
+                         (group-by author)
+                         (reduce-kv (fn [v a cs]
+                                      (conj v (assoc a :commits (mapv :id cs))))
+                                    []))]
+    ["UNWIND {authorships} AS author
+      MERGE (a {name: author.name, email: author.email})
+      SET a :Author
+      WITH a, author.commits AS hashes
+      UNWIND hashes AS hash
+      MATCH (c:Commit {id: hash})
+      WITH a, c
+      CREATE UNIQUE (a)-[:AUTHORED]->(c);"
+     {:authorships authorships}]))
+
+;; TODO: not parallelizable with authorship, so why not fuse them to a single statement?
+(defn load-commissions-stmt [cs]
+  (let [committer   (fn [c] {:name  (-> c :raw .getCommitterIdent .getName)
+                             :email (-> c :raw .getCommitterIdent .getEmailAddress)})
+        commissions (->> cs
+                         (group-by committer)
+                         (reduce-kv (fn [v a cs]
+                                      (conj v (assoc a :commits (mapv :id cs))))
+                                    []))]
+    ["UNWIND {commissions} AS committer
+      MERGE (a {name: committer.name, email: committer.email})
+      SET a :Committer
+      WITH a, committer.commits AS hashes
+      UNWIND hashes AS hash
+      MATCH (c:Commit {id: hash})
+      WITH a, c
+      CREATE UNIQUE (a)-[:COMMITTED]->(c);"
+     {:commissions commissions}]))
+
+(defn load-changesets-stmt [cs]
+  (let [change-sets (mapv (fn [c] {:id    (:id c)
+                                   :files (for [[f a] (:changed_files c)]
+                                            {:name f :action (name a)})})
+                          cs)]
+    ["UNWIND {changesets} AS changeset
+      MATCH (c:Commit {id: changeset.id})
+      WITH c, changeset.files AS files
+      UNWIND files AS file
+      MERGE (f:File {name: file.name})
+      MERGE (c)-[:CHANGES {action: file.action}]->(f);"
+     {:changesets change-sets}]))
+
+(defn load-parent-relations-stmt [cs]
+  (let [relations (mapv (fn [c] {:id      (:id c)
+                                 :parents (mapv #(-> % .getName str)
+                                                (-> c :raw .getParents))})
+                        cs)]
+    ["UNWIND {relations} AS relation
+      MATCH (a:Commit {id: relation.id}), (p:Commit)
+      WHERE p.id IN relation.parents
+      CREATE UNIQUE (a)-[:HAS_PARENT]->(p);"
+     {:relations relations}]))
 
 (def label-merge-commits-stmt
   ["MATCH (c:Commit)-[p:HAS_PARENT]->()
@@ -87,27 +114,113 @@
       (run-query! session qry params))))
 
 
-;; TODO: rewrite import to run in parallel, first for the list of commits,
-;;       then files, then authors, creating historical relations last
-;;       --> extract, transform, load
+;; TODO: include rename detection (jgit's RenameDetector?)
+
+(defn import-graph [repo]
+  (with-open [conn (neobolt/connect "bolt://localhost")]
+    (let [parallelism      4
+          stmt-buffer-size (* 2 parallelism)
+          commits-per-stmt 20
+          make-loader      (fn [ch conn]
+                             (async/thread
+                               (with-open [session (neobolt/create-session conn)]
+                                 (loop []
+                                   (when-let [[qry params] (async/<!! ch)]
+                                     (run-query! session qry params)
+                                     (recur))))))
+          loader-ch        (async/chan stmt-buffer-size)
+          loaders          (into [] (repeat parallelism (make-loader loader-ch conn)))]
+
+      (println "Loading git graph ...")
+      (<!! (async/onto-chan loader-ch (map load-commits-stmt (partition-all commits-per-stmt (commits repo))) false))
+      (<!! (async/onto-chan loader-ch [(load-authorships-stmt (commits repo))] false))
+      (<!! (async/onto-chan loader-ch [(load-commissions-stmt (commits repo))] false))
+      (<!! (async/onto-chan loader-ch (map load-changesets-stmt (partition-all commits-per-stmt (commits repo))) false))
+      (<!! (async/onto-chan loader-ch (map load-parent-relations-stmt (partition-all commits-per-stmt (commits repo)))))
+
+      (async/<!! (async/map vector loaders))
+
+      ; (println "Post-processing the graph ...")
+      ; (run-statements! conn [label-merge-commits-stmt
+      ;                        label-test-files-stmt
+      ;                                   ; merge-authors-with-same-name-stmt
+      ;                        ])))
+      )
+
+    #_(let [commit-buffer-size 100
+          parallelism        4
+          stmt-buffer-size   (* 2 parallelism)
+          commits-per-stmt   10
+          commits-ch         (async/chan commit-buffer-size)
+          commits-mult       (async/mult commits-ch)
+          commits-stmts-ch   (async/tap commits-mult
+                                        (async/chan stmt-buffer-size
+                                                    (comp (partition-all commits-per-stmt)
+                                                          (map load-commits-stmt))))
+          authors-stmt-ch    (async/transduce (map (fn [c] {:name (:author c) :email (:email c)}))
+                                              #(update-in %1 [1 :authors] conj %2)
+                                              ["UNWIND {authors} AS author
+                                                MERGE (a {name: author.name, email: author.email})
+                                                SET a :Author;"
+                                               {:authors #{}}]
+                                              (async/tap commits-mult (async/chan)))
+          make-loader        (fn [ch conn]
+                               (async/thread
+                                 (with-open [session (neobolt/create-session conn)]
+                                   (loop []
+                                     (when-let [[qry params] (async/<!! ch)]
+                                       (run-query! session qry params)
+                                       (recur))))))
+          loader-ch          (async/chan stmt-buffer-size)
+          loaders            (into [] (repeat parallelism (make-loader loader-ch conn)))]
+
+      (async/pipe commits-stmts-ch loader-ch)
+      (async/pipe authors-stmt-ch loader-ch)
+
+      #_(async/pipeline parallelism stmt-ch
+                      (map load-authorships-stmt) ;; bullshit: no map, pass all commits! --> use thread
+                      (make-extractor repo)
+                      false)
+      #_(async/pipeline parallelism stmt-ch
+                      (map load-commissions-stmt)
+                      (make-extractor repo)
+                      false)
+      #_(async/pipeline parallelism stmt-ch
+                      (comp (partition-all commits-per-stmt)
+                            (map load-changesets-stmt))
+                      (make-extractor repo)
+                      false)
+      #_(async/pipeline parallelism stmt-ch
+                      (comp (partition-all commits-per-stmt)
+                            (map load-parent-relations-stmt))
+                      (make-extractor repo)
+                      true)
+
+      (async/<!! (async/onto-chan commits-ch (commits repo)))
+
+      ;; wait for loaders to finish
+      (async/<!! (async/map vector loaders)))
+    ))
+
+(defn import-graph-serial [repo]
+  (with-open [conn (neobolt/connect "bolt://localhost")]
+
+    (println "Loading git graph ...")
+    (run-statements! conn [(load-commits-stmt (commits repo))])
+
+    (run-statements! conn [(load-authorships-stmt (commits repo))])
+    (run-statements! conn [(load-commissions-stmt (commits repo))])
+    (run-statements! conn [(load-changesets-stmt (commits repo))])
+    (run-statements! conn [(load-parent-relations-stmt (commits repo))])
+
+    (println "Post-processing the graph ...")
+    (run-statements! conn [label-merge-commits-stmt
+                           label-test-files-stmt
+                                        ; merge-authors-with-same-name-stmt
+                           ])))
 
 
-(defn import-graph [repo-path]
-  (let [repo (load-repo repo-path)
-        cs   (commits repo)]
-    (with-open [conn (neobolt/connect "bolt://localhost")]
-      (let [grain-size    250
-            run-parallel! (fn [stmts]
-                            (dorun (pmap (partial run-statements! conn)
-                                         (partition-all grain-size stmts))))]
-        (println "Extracting commits ...")
-        (run-parallel! (map import-commit-stmt cs))
-        (println "Extracting history relations ...")
-        (run-parallel! (mapcat import-parent-rel-stmts cs))
-        (println "Post-processing the graph ...")
-        (run-statements! conn [label-merge-commits-stmt
-                               label-test-files-stmt
-                               merge-authors-with-same-name-stmt])))))
+;; analyses
 
 (defn count-commits
   "Counts the total number of commits, excluding merge commits."
@@ -122,8 +235,9 @@
   [session n limit]
   (let [query  "MATCH (a:File)<-[:CHANGES]-(c:Commit)-[:CHANGES]->(b:File)
                 WHERE NOT c:Merge
-                      AND NOT a:Test AND NOT b:Test
-                      AND a.name ENDS WITH '.java' AND b.name ENDS WITH '.java' AND id(a) < id(b)
+                      // AND NOT a:Test AND NOT b:Test
+                      // AND a.name ENDS WITH '.java' AND b.name ENDS WITH '.java'
+                      AND id(a) < id(b)
                 WITH a, b, count(c) AS freq
                 WHERE freq > {maxfreq}
                 RETURN a.name AS a, b.name AS b, freq
