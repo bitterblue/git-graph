@@ -5,6 +5,7 @@ services:
     image: neo4j-apoc
     volumes:
       - graph-data:/data
+      - ./import:/import
     ports:
       - "7474:7474"
       - "7687:7687"

@@ -6,4 +6,5 @@
   :dependencies [[org.clojure/clojure "1.8.0"]
                  [clojurewerkz/neocons "3.2.0"]
                  [clj-jgit "0.8.9"]
-                 [org.clojure/core.async "0.3.442"]])
+                 [org.clojure/core.async "0.3.442"]
+                 [org.clojure/data.csv "0.1.3"]])
