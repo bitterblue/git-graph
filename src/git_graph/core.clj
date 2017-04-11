@@ -106,97 +106,134 @@
 (defn run-query!
   ([session qry] (run-query! session qry nil))
   ([session qry params]
-   (neobolt/query session qry (clojure.walk/stringify-keys params))))
+   (let [params (clojure.walk/stringify-keys params)]
+     (try
+       (neobolt/query session qry params)
+       (catch Exception e
+         (println "Exception when running query: " qry " with param map " params "!")
+         (throw e))))))
 
 (defn run-statements! [conn stmts]
   (with-open [session (neobolt/create-session conn)]
     (doseq [[qry params] stmts]
       (run-query! session qry params))))
 
+(def parallelism 4)
+(def buffer-size (* 2 parallelism))
+
+(defn nodes-stream [repo]
+  (let [commit-ch    (async/chan buffer-size)
+        commit-mult  (async/mult commit-ch)
+        commit-nodes (async/tap commit-mult
+                                (async/chan buffer-size
+                                            (map (fn [c]
+                                                   {:type    :commit
+                                                    :id      (:id c)
+                                                    :time    (.getTime (:time c))
+                                                    :message (:message c)}))))
+        author-nodes (async/tap commit-mult
+                                (async/chan buffer-size
+                                            (comp (mapcat (fn [c]
+                                                            [{:type  :author
+                                                              :name  (:author c)
+                                                              :email (:email c)}
+                                                             {:type  :author
+                                                              :name  (-> c :raw .getCommitterIdent .getName)
+                                                              :email (-> c :raw .getCommitterIdent .getEmailAddress)}]))
+                                                  (distinct))))
+        file-nodes   (async/tap commit-mult
+                                (async/chan buffer-size
+                                            (comp (mapcat (fn [c]
+                                                            (for [[f a] (:changed_files c)]
+                                                              {:type :file
+                                                               :name f})))
+                                                  (distinct))))]
+    (async/onto-chan commit-ch (commits repo))
+    (async/merge [commit-nodes author-nodes file-nodes] buffer-size)))
+
+(defn relations-stream [repo]
+  (let [commit-ch   (async/chan buffer-size)
+        commit-mult (async/mult commit-ch)
+        parent-rels (async/tap commit-mult
+                               (async/chan buffer-size
+                                           (map (fn [c]
+                                                  {:type    :parent
+                                                   :id      (:id c)
+                                                   :message (mapv #(-> % .getName str)
+                                                                  (-> c :raw .getParents))}))))
+        authorships (async/tap commit-mult
+                               (async/chan buffer-size
+                                           (mapcat (fn [c]
+                                                     [{:type  :authored
+                                                       :id    (:id c)
+                                                       :name  (:author c)
+                                                       :email (:email c)}
+                                                      {:type  :committed
+                                                       :id    (:id c)
+                                                       :name  (-> c :raw .getCommitterIdent .getName)
+                                                       :email (-> c :raw .getCommitterIdent .getEmailAddress)}]))))
+        changesets (async/tap commit-mult
+                              (async/chan buffer-size
+                                          (mapcat (fn [c]
+                                                    [{:type :changed-files
+                                                      :id (:id c)
+                                                      :files (into []
+                                                                   (for [[f a] (:changed_files c)]
+                                                                     {:name f :action (name a)}))}]))))]
+    (async/onto-chan commit-ch (commits repo))
+    (async/merge [parent-rels authorships changesets] buffer-size)))
+
+(defmulti load-stmt :type)
+(defmethod load-stmt :commit [node]
+  ["CREATE (c:Commit {id: {commit}.id}) SET c = {commit};"
+   {:commit (dissoc node :type)}])
+(defmethod load-stmt :author [node]
+  ["CREATE (a {name: {author}.name, email: {author}.email})
+    SET a = {author}
+    SET a :Author;"
+   {:author (dissoc node :type)}])
+(defmethod load-stmt :file [node]
+  ["CREATE (f:File {name: {file}.name}) SET f = {file};"
+   {:file (dissoc node :type)}])
+(defmethod load-stmt :parent [rel]
+  ["UNWIND {relations} AS relation
+    MATCH (a:Commit {id: relation.id}), (p:Commit)
+    WHERE p.id IN relation.parents
+    CREATE UNIQUE (a)-[:HAS_PARENT]->(p);"
+   {:relations (dissoc rel :type)}])
+(defmethod load-stmt :authored [rel]
+  ["MATCH (a:Author {name: {rel}.name, email: {rel}.email}), (c:Commit {id: {rel}.id})
+    CREATE UNIQUE (a)-[:AUTHORED]->(c);"
+   {:rel (dissoc rel :type)}])
+(defmethod load-stmt :committed [rel]
+  ["MATCH (a:Author {name: {rel}.name, email: {rel}.email}), (c:Commit {id: {rel}.id})
+    CREATE UNIQUE (a)-[:COMMITTED]->(c);"
+   {:rel (dissoc rel :type)}])
+(defmethod load-stmt :changed-files [rel]
+  ["MATCH (c:Commit {id: {changeset}.id})
+    WITH c, {changeset}.files AS files
+    UNWIND files AS file
+    MERGE (f:File {name: file.name})
+    MERGE (c)-[:CHANGES {action: file.action}]->(f);"
+   {:changeset (dissoc rel :type)}])
 
 ;; TODO: include rename detection (jgit's RenameDetector?)
 
 (defn import-graph [repo]
   (with-open [conn (neobolt/connect "bolt://localhost")]
-    (let [parallelism      4
-          stmt-buffer-size (* 2 parallelism)
-          commits-per-stmt 20
-          make-loader      (fn [ch conn]
-                             (async/thread
-                               (with-open [session (neobolt/create-session conn)]
-                                 (loop []
-                                   (when-let [[qry params] (async/<!! ch)]
-                                     (run-query! session qry params)
-                                     (recur))))))
-          loader-ch        (async/chan stmt-buffer-size)
-          loaders          (into [] (repeat parallelism (make-loader loader-ch conn)))]
+    (let [make-loader (fn [ch conn]
+                        (async/thread
+                          (with-open [session (neobolt/create-session conn)]
+                            (loop []
+                              (when-let [[qry params] (async/<!! ch)]
+                                (run-query! session qry params)
+                                (recur))))))
+          loader-ch   (async/chan buffer-size)
+          loaders     (into [] (repeat parallelism (make-loader loader-ch conn)))]
 
-      (println "Loading git graph ...")
-      (<!! (async/onto-chan loader-ch (map load-commits-stmt (partition-all commits-per-stmt (commits repo))) false))
-      (<!! (async/onto-chan loader-ch [(load-authorships-stmt (commits repo))] false))
-      (<!! (async/onto-chan loader-ch [(load-commissions-stmt (commits repo))] false))
-      (<!! (async/onto-chan loader-ch (map load-changesets-stmt (partition-all commits-per-stmt (commits repo))) false))
-      (<!! (async/onto-chan loader-ch (map load-parent-relations-stmt (partition-all commits-per-stmt (commits repo)))))
-
-      (async/<!! (async/map vector loaders))
-
-      ; (println "Post-processing the graph ...")
-      ; (run-statements! conn [label-merge-commits-stmt
-      ;                        label-test-files-stmt
-      ;                                   ; merge-authors-with-same-name-stmt
-      ;                        ])))
-      )
-
-    #_(let [commit-buffer-size 100
-          parallelism        4
-          stmt-buffer-size   (* 2 parallelism)
-          commits-per-stmt   10
-          commits-ch         (async/chan commit-buffer-size)
-          commits-mult       (async/mult commits-ch)
-          commits-stmts-ch   (async/tap commits-mult
-                                        (async/chan stmt-buffer-size
-                                                    (comp (partition-all commits-per-stmt)
-                                                          (map load-commits-stmt))))
-          authors-stmt-ch    (async/transduce (map (fn [c] {:name (:author c) :email (:email c)}))
-                                              #(update-in %1 [1 :authors] conj %2)
-                                              ["UNWIND {authors} AS author
-                                                MERGE (a {name: author.name, email: author.email})
-                                                SET a :Author;"
-                                               {:authors #{}}]
-                                              (async/tap commits-mult (async/chan)))
-          make-loader        (fn [ch conn]
-                               (async/thread
-                                 (with-open [session (neobolt/create-session conn)]
-                                   (loop []
-                                     (when-let [[qry params] (async/<!! ch)]
-                                       (run-query! session qry params)
-                                       (recur))))))
-          loader-ch          (async/chan stmt-buffer-size)
-          loaders            (into [] (repeat parallelism (make-loader loader-ch conn)))]
-
-      (async/pipe commits-stmts-ch loader-ch)
-      (async/pipe authors-stmt-ch loader-ch)
-
-      #_(async/pipeline parallelism stmt-ch
-                      (map load-authorships-stmt) ;; bullshit: no map, pass all commits! --> use thread
-                      (make-extractor repo)
-                      false)
-      #_(async/pipeline parallelism stmt-ch
-                      (map load-commissions-stmt)
-                      (make-extractor repo)
-                      false)
-      #_(async/pipeline parallelism stmt-ch
-                      (comp (partition-all commits-per-stmt)
-                            (map load-changesets-stmt))
-                      (make-extractor repo)
-                      false)
-      #_(async/pipeline parallelism stmt-ch
-                      (comp (partition-all commits-per-stmt)
-                            (map load-parent-relations-stmt))
-                      (make-extractor repo)
-                      true)
-
-      (async/<!! (async/onto-chan commits-ch (commits repo)))
+      (let [nodes-ch (nodes-stream repo)
+            rels-ch  (relations-stream repo)]
+        (<!! (,,,)))
 
       ;; wait for loaders to finish
       (async/<!! (async/map vector loaders)))
