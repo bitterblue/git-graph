@@ -1,77 +1,13 @@
 (ns git-graph.core
-  (:require [clj-jgit
-             [porcelain :as jgit]
-             [querying :as jgit-query]]
-            [clojure.data.csv :as csv]
-            [clojure.java.io :as io]
-            [clojurewerkz.neocons.bolt :as neobolt]))
+  (:require [clojurewerkz.neocons.bolt :as neobolt]))
 
-(defn- load-repo [path]
-  (-> (jgit/discover-repo path)
-      (jgit/load-repo)))
 
-(defn commits
-  "Returns a seq of commit-infos for all commits in the history of the current branch."
-  [repo]
-  (map (partial jgit-query/commit-info repo) (jgit/git-log repo)))
-
-(defn write-csv [writer records]
-  (when-first [record records]
-    (let [header-line (apply str (interpose "," (map name (keys record))))]
-      (.write writer header-line)
-      (.write writer "\n")
-      (csv/write-csv writer (map vals records)))))
-
-(defn dump-csv [repo]
-  (let [commit-props      (fn [c] {:id      (:id c)
-                                   :time    (.getTime (:time c))
-                                   :message (:message c)})
-        author            (fn [c] {:name (:author c) :email (:email c)})
-        committer         (fn [c] {:name  (-> c :raw .getCommitterIdent .getName)
-                                   :email (-> c :raw .getCommitterIdent .getEmailAddress)})
-        authorships       (fn [person-fn]
-                            (->> (commits repo)
-                                 (group-by person-fn)
-                                 (reduce-kv (fn [v a cs]
-                                              (conj v (assoc a :commits (apply str (interpose ";" (mapv :id cs))))))
-                                            [])))
-        change-sets       (mapcat (fn [c]
-                                    (mapv (fn [[f a]] {:commit (:id c) :name f :action (name a)})
-                                          (:changed_files c)))
-                                  (commits repo))
-        ancestry          (map (fn [c] {:id      (:id c)
-                                        :parents (->> (-> c :raw .getParents)
-                                                      (map #(-> % .getName str))
-                                                      (interpose ";")
-                                                      (apply str))})
-                               (commits repo))
-        export-csv-thread (fn [{:keys [filename entries]}]
-                            (future (with-open [writer (io/writer filename)]
-                                      (write-csv writer @entries))))]
-    (run! deref
-          (mapv export-csv-thread [{:filename "import/commits.csv"
-                                    :entries (delay (map commit-props (commits repo)))}
-                                   {:filename "import/authorship.csv"
-                                    :entries (delay (authorships author))}
-                                   {:filename "import/commissions.csv"
-                                    :entries (delay (authorships committer))}
-                                   {:filename "import/changesets.csv"
-                                    :entries (delay change-sets)}
-                                   {:filename "import/ancestry.csv"
-                                    :entries (delay ancestry)}]))))
-
-;; export as csv, then run the import script in cypher-shell
-;; $ cat cypher/import-repository.cypher | docker exec -i <container> /var/lib/neo4j/bin/cypher-shell
-
+;; Neo4j bolt queries
 
 (defn run-query!
   ([session qry] (run-query! session qry nil))
   ([session qry params]
    (neobolt/query session qry (clojure.walk/stringify-keys params))))
-
-
-
-;; TODO: include rename detection (jgit's RenameDetector?)
 
 
 ;; analyses
