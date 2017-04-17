@@ -6,4 +6,6 @@
   :dependencies [[org.clojure/clojure "1.8.0"]
                  [clojurewerkz/neocons "3.2.0"]
                  [clj-jgit "0.8.9"]
-                 [org.clojure/data.csv "0.1.3"]])
+                 [org.clojure/data.csv "0.1.3"]
+                 [clj-time "0.13.0"]
+                 [incanter "1.5.7"]])

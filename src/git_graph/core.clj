@@ -1,13 +1,21 @@
 (ns git-graph.core
-  (:require [clojurewerkz.neocons.bolt :as neobolt]))
-
+  (:require [clojurewerkz.neocons.bolt :as neobolt]
+            [incanter
+             [core :refer [matrix]]
+             [stats :as stats]]))
 
 ;; Neo4j bolt queries
 
 (defn run-query!
   ([session qry] (run-query! session qry nil))
   ([session qry params]
-   (neobolt/query session qry (clojure.walk/stringify-keys params))))
+   (clojure.walk/keywordize-keys
+    (neobolt/query session qry (clojure.walk/stringify-keys params)))))
+
+(defmacro with-local-bolt-sess [& body]
+  `(with-open [conn#  (neobolt/connect "bolt://localhost")
+               ~'sess (neobolt/create-session conn#)]
+     ~@body))
 
 
 ;; analyses
@@ -17,7 +25,7 @@
   [session]
   (let [query  "MATCH (c:Commit) WHERE NOT c:Merge RETURN count(c) AS n;"
         result (run-query! session query)]
-    (get (first result) "n")))
+    (-> result first :n)))
 
 (defn pair-freqs
   "Returns a seq of file pairs and how often they occur. Only pairs occuring more
@@ -25,7 +33,7 @@
   [session n limit]
   (let [query  "MATCH (a:File)<-[:CHANGES]-(c:Commit)-[:CHANGES]->(b:File)
                 WHERE NOT c:Merge
-                      // AND NOT a:Test AND NOT b:Test
+                      AND NOT a:Test AND NOT b:Test
                       // AND a.name ENDS WITH '.java' AND b.name ENDS WITH '.java'
                       AND id(a) < id(b)
                 WITH a, b, count(c) AS freq
@@ -34,7 +42,7 @@
                 ORDER BY freq DESC
                 LIMIT {limit};"
         result (run-query! session query {:maxfreq n :limit limit})]
-    (clojure.walk/keywordize-keys result)))
+    result))
 
 (defn count-changes
   "Count the commits changing a specified file, excluding merge commits."
@@ -43,7 +51,7 @@
                 WHERE f.name =  {filename} AND NOT c:Merge
                 RETURN count(c) AS n;"
         result (run-query! session query {:filename f})]
-    (get (first result) "n")))
+    (-> result first :n)))
 
 (defn mcc
   "Calculate the Matthews Correlation Coefficient (MCC). The MCC indicates the
@@ -60,21 +68,26 @@
         calculate-mcc (fn [{:keys [a b freq]}]
                         (let [only-a  (- (count-changes a) freq)
                               only-b  (- (count-changes b) freq)
-                              neither (- num-commits only-a only-b freq)]
+                              neither (- num-commits only-a only-b freq)
+                              chi-sq  (stats/chisq-test :table (matrix [[neither only-a] [only-b freq]]))]
                           {:only-a  only-a
                            :only-b  only-b
                            :neither neither
                            :both    freq
-                           :mcc     (mcc neither only-a only-b freq)}))]
+                           :mcc     (mcc neither only-a only-b freq)
+                           :chi-sq  (:X-sq chi-sq)
+                           :phi-coefficient (Math/sqrt (/ (:X-sq chi-sq) num-commits))
+                           :p-value (:p-value chi-sq)}))]
     (into [] (map (fn [p] (merge p (calculate-mcc p)))) pairs)))
 
-;; TODO: implement chi² test and check p-values
-
-
-(defmacro with-local-bolt-sess [& body]
-  `(with-open [conn#  (neobolt/connect "bolt://localhost")
-               ~'sess (neobolt/create-session conn#)]
-     ~@body))
+(defn hotspot-analysis [session n interval]
+  (let [query "MATCH (c:Commit)-->(f:File)
+               WITH f, count(c) AS num_changes
+               RETURN f.name, num_changes
+               ORDER BY num_changes DESCENDING
+               LIMIT {n};"
+        result (run-query! session query {:n n})]
+    result))
 
 ;; more possible metrics
 ;; * most frequently changed files (hotspot analysis)
