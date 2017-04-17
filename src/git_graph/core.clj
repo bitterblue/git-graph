@@ -1,8 +1,10 @@
 (ns git-graph.core
-  (:require [clojurewerkz.neocons.bolt :as neobolt]
+  (:require [clj-time.core :as t]
+            [clojurewerkz.neocons.bolt :as neobolt]
             [incanter
              [core :refer [matrix]]
-             [stats :as stats]]))
+             [stats :as stats]]
+            [clj-time.coerce :refer [to-long]]))
 
 ;; Neo4j bolt queries
 
@@ -80,21 +82,40 @@
                            :p-value (:p-value chi-sq)}))]
     (into [] (map (fn [p] (merge p (calculate-mcc p)))) pairs)))
 
-(defn hotspot-analysis [session n interval]
-  (let [query "MATCH (c:Commit)-->(f:File)
-               WITH f, count(c) AS num_changes
-               RETURN f.name, num_changes
+(defn hotspot-analysis
+  "Returns the n most frequently changed files in the specified interval."
+  ([session n] (hotspot-analysis session n (t/interval (t/epoch) (t/now))))
+  ([session n interval]
+   (let [query "MATCH (c:Commit)-->(f:File)
+               WHERE {start} < c.time AND c.time < {end}
+               WITH f.name AS name, count(c) AS num_changes
+               RETURN name, num_changes
                ORDER BY num_changes DESCENDING
                LIMIT {n};"
-        result (run-query! session query {:n n})]
-    result))
+         result (run-query! session query
+                            {:n     n
+                             :start (to-long (t/start interval))
+                             :end   (to-long (t/end interval))})]
+     result)))
+
+(defn busfactor-analysis
+  "Returns a list of n files and their authors where the number of authors is no
+  larger than the specified maximum, 1 by default. The author nodes of the graph
+  may have to be cleaned up first."
+  ([session n] (busfactor-analysis session n 1))
+  ([session n max]
+   (let [query "MATCH (a:Author)-->(c:Commit)-->(f:File)
+               WITH f.name AS name, collect(a.name) AS authors, count(a) AS busfactor
+               WHERE busfactor <= {max}
+               RETURN name, busfactor, authors
+               ORDER BY busfactor ASCENDING
+               LIMIT {n}"
+         result (run-query! session query
+                            {:n   n
+                             :max max})]
+     result)))
 
 ;; more possible metrics
-;; * most frequently changed files (hotspot analysis)
-;;   MATCH (f:File)<--(c:Commit) WITH f, count(c) AS change_counter RETURN f.name, change_counter ORDER BY change_counter DESC;
-;; * bus factor (number of authors per file)
-;;   requires clean-up of author nodes
-;;   MATCH (f:File)<--(c:Commit)<--(a:Author) WITH f, count(a) AS busfactor WHERE busfactor < 1 RETURN f.name, busfactor LIMIT 10;
 ;; * testing quotient (how strictly are changes to main accompanied by changes to test?)
 ;;   could indicate either lacking test coverage or a rigidity hazard caused by
 ;;   the test suite that will make refactoring expensive
