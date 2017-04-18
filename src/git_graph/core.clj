@@ -30,20 +30,20 @@
     (-> result first :n)))
 
 (defn pair-freqs
-  "Returns a seq of file pairs and how often they occur. Only pairs occuring more
-  than n times are returned, and only a number up to the specified limit."
-  [session n limit]
+  "Returns a seq of file pairs and how often they occur. Does not return more than
+  limit file pairs."
+  [session limit]
   (let [query  "MATCH (a:File)<-[:CHANGES]-(c:Commit)-[:CHANGES]->(b:File)
-                WHERE NOT c:Merge
+                WHERE NOT a.deleted AND NOT b.deleted
                       AND NOT a:Test AND NOT b:Test
-                      // AND a.name ENDS WITH '.java' AND b.name ENDS WITH '.java'
+                      AND a.name ENDS WITH '.java' AND b.name ENDS WITH '.java'
                       AND id(a) < id(b)
-                WITH a, b, count(c) AS freq
-                WHERE freq > {maxfreq}
-                RETURN a.name AS a, b.name AS b, freq
-                ORDER BY freq DESC
+                      AND NOT c:Merge
+                WITH a.name AS a, b.name AS b, count(c) AS freq
+                RETURN a, b, freq
+                ORDER BY freq DESCENDING
                 LIMIT {limit};"
-        result (run-query! session query {:maxfreq n :limit limit})]
+        result (run-query! session query {:limit limit})]
     result))
 
 (defn count-changes
@@ -115,7 +115,9 @@
                              :max max})]
      result)))
 
-;; more possible metrics
+;; more queries
+;; * identify refactoring commits: commits that either only change :Test files
+;;   or no :Test files at all
 ;; * testing quotient (how strictly are changes to main accompanied by changes to test?)
 ;;   could indicate either lacking test coverage or a rigidity hazard caused by
 ;;   the test suite that will make refactoring expensive

@@ -6,7 +6,8 @@
             [clojure.data.csv :as csv]
             [clojure.java
              [io :as io]
-             [shell :refer [sh]]]))
+             [shell :refer [sh]]]
+            [clojure.string :refer [split-lines]]))
 
 ;; jgit
 
@@ -34,7 +35,7 @@
 (defn export-csv [repo csv-dir]
   (let [commit-props      (fn [c] {:id      (:id c)
                                    :time    (.getTime (:time c))
-                                   :message (:message c)})
+                                   :message (-> (:message c) split-lines first)})
         author            (fn [c] {:name (:author c) :email (:email c)})
         committer         (fn [c] {:name  (-> c :raw .getCommitterIdent .getName)
                                    :email (-> c :raw .getCommitterIdent .getEmailAddress)})

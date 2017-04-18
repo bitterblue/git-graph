@@ -60,6 +60,13 @@ MATCH (f:File)
 WHERE f.name CONTAINS '/test/'
 SET f :Test;
 
+// mark files as deleted, iff they were deleted by the last commit that touched them
+MATCH (c:Commit)-->(f:File)
+WITH f, max(c.time) AS last_modified
+MATCH (c:Commit)-[r:CHANGES]->(f)
+WHERE c.time = last_modified
+SET f.deleted = (r.action = "delete");
+
 // merge author nodes with same name
 // MATCH (a:Author)
 // WITH a.name AS name, collect(a) AS authors, collect(a.email) AS emails, count(a) AS hits
