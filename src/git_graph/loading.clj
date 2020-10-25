@@ -11,7 +11,7 @@
 
 ;; jgit
 
-(defn- load-repo [path]
+(defn load-repo [path]
   (-> (jgit/discover-repo path)
       (jgit/load-repo)))
 
@@ -74,7 +74,7 @@
 ;; load graph
 
 (defn cypher-shell [s]
-  (let [neo4j-container "gitgraph_neo4j_1"
+  (let [neo4j-container "git-graph_neo4j_1"
         std-in          (if (string? s) (java.io.StringReader. s) s)]
     (sh "docker" "exec" "--interactive" neo4j-container "/var/lib/neo4j/bin/cypher-shell"
         :in std-in)))

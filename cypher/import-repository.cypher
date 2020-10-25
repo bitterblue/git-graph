@@ -11,7 +11,7 @@ CREATE CONSTRAINT ON (f:File) ASSERT f.name IS UNIQUE;
 USING PERIODIC COMMIT
 LOAD CSV WITH HEADERS FROM "file:///commits.csv" AS commit
 MERGE (c:Commit {id: commit.id})
-ON CREATE SET c.time = toInt(commit.time),
+ON CREATE SET c.time = datetime({epochMillis:toInteger(commit.time)}),
               c.message = commit.message;
 
 // authors and their relations to commits
